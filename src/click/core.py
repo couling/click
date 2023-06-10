@@ -424,6 +424,7 @@ class Context:
         #: Show option default values when formatting help text.
         self.show_default: t.Optional[bool] = show_default
 
+        self._delayed_execution_callbacks: t.List[t.Callable[[], t.Any]] = []
         self._close_callbacks: t.List[t.Callable[[], t.Any]] = []
         self._depth = 0
         self._parameter_source: t.Dict[str, ParameterSource] = {}
@@ -825,6 +826,17 @@ class Context:
         """
         return self._parameter_source.get(name)
 
+    def add_delayed_callback(self, callback: t.Callable[[], t.Any]) -> None:
+        self._delayed_execution_callbacks.append(callback)
+
+    def execute_delayed_callbacks(self) -> None:
+        if self.parent is not None:
+            self.parent.execute_delayed_callbacks()
+        callbacks = self._delayed_execution_callbacks
+        self._delayed_execution_callbacks = []
+        for callback in callbacks:
+            callback()
+
 
 class BaseCommand:
     """The base command implements the minimal API contract of commands.
@@ -1204,6 +1216,7 @@ class Command(BaseCommand):
         no_args_is_help: bool = False,
         hidden: bool = False,
         deprecated: bool = False,
+        skip_delayed_execution: bool = False,
     ) -> None:
         super().__init__(name, context_settings)
         #: the callback to execute when the command fires.  This might be
@@ -1221,6 +1234,7 @@ class Command(BaseCommand):
         self.no_args_is_help = no_args_is_help
         self.hidden = hidden
         self.deprecated = deprecated
+        self.skip_delayed_execution = skip_delayed_execution
 
     def to_info_dict(self, ctx: Context) -> t.Dict[str, t.Any]:
         info_dict = super().to_info_dict(ctx)
@@ -1418,6 +1432,9 @@ class Command(BaseCommand):
             ).format(name=self.name)
             echo(style(message, fg="red"), err=True)
 
+        if not self.skip_delayed_execution:
+            ctx.execute_delayed_callbacks()
+
         if self.callback is not None:
             return ctx.invoke(self.callback, **ctx.params)
 
@@ -1494,10 +1511,12 @@ class MultiCommand(Command):
         subcommand_metavar: t.Optional[str] = None,
         chain: bool = False,
         result_callback: t.Optional[t.Callable[..., t.Any]] = None,
+        delay_execution: bool = False,
         **attrs: t.Any,
     ) -> None:
         super().__init__(name, **attrs)
 
+        self.delay_execution = delay_execution
         if no_args_is_help is None:
             no_args_is_help = not invoke_without_command
 
@@ -1670,8 +1689,12 @@ class MultiCommand(Command):
                 cmd_name, cmd, args = self.resolve_command(ctx, args)
                 assert cmd is not None
                 ctx.invoked_subcommand = cmd_name
-                super().invoke(ctx)
-                sub_ctx = cmd.make_context(cmd_name, args, parent=ctx)
+                if self.delay_execution:
+                    ctx.add_delayed_callback(partial(super().invoke, ctx))
+                    sub_ctx = cmd.make_context(cmd_name, args, parent=ctx)
+                else:
+                    super().invoke(ctx)
+                    sub_ctx = cmd.make_context(cmd_name, args, parent=ctx)
                 with sub_ctx:
                     return _process_result(sub_ctx.command.invoke(sub_ctx))
 
